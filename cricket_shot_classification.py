@@ -1,238 +1,259 @@
+!pip install opencv-python tensorflow keras-tuner
+
 import os
 import cv2
-import json
 import numpy as np
 import tensorflow as tf
-import argparse
-from pathlib import Path
-from dataclasses import dataclass, asdict
-
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (Input, Conv3D, MaxPooling3D, BatchNormalization,
-                                     GlobalAveragePooling3D, Dense, Dropout)
+from tensorflow.keras.layers import (Input, Conv3D, MaxPooling3D,
+                                    BatchNormalization, GlobalAveragePooling3D,
+                                    Dense, Dropout, Multiply, Reshape,
+                                    Concatenate, Add, Lambda)
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.callbacks import (ModelCheckpoint, EarlyStopping,
+                                       ReduceLROnPlateau)
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib
-matplotlib.use("Agg")   # headless
-import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
+import matplotlib.pyplot as plt
+from kerastuner import HyperModel, RandomSearch
+from google.colab import drive
 
-# ---- config/dataclass ----
-@dataclass
-class Config:
-    frame_height: int = 100
-    frame_width: int = 100
-    num_frames: int = 14
-    num_classes: int = 5
-    batch_size: int = 8
-    epochs: int = 40
-    learning_rate: float = 1e-4
-    seed: int = 42
+# Mount Google Drive
+drive.mount('/content/drive')
 
-def set_seeds(seed: int):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
+FRAME_HEIGHT = 100
+FRAME_WIDTH = 100
+NUM_FRAMES = 14
+NUM_CLASSES = 5 #replace it with number of classes you are using
+BATCH_SIZE = 8
+EPOCHS = 40
+LEARNING_RATE = 1e-4
 
-# ==================== VIDEO PROCESSING ====================
+# Paths
+TRAIN_DATA_PATH = "/content/drive/MyDrive/CKT Dataset" # replace it with your dataset path
+TEST_DATA_PATH = "/content/drive/MyDrive/test videos3" # replace it with your dataset path
+MODEL_PATH = "/content/drive/MyDrive/cricket_shot_3d_attention_model4.h5" 
+
+
 class VideoProcessor:
-    def __init__(self, frame_height: int, frame_width: int, num_frames: int):
+    def __init__(self, frame_height=FRAME_HEIGHT, frame_width=FRAME_WIDTH):
         self.frame_height = frame_height
         self.frame_width = frame_width
-        self.num_frames = num_frames
 
-    def extract_frames(self, video_path):
-        cap = cv2.VideoCapture(str(video_path))
+    def extract_frames(self, video_path, num_frames=NUM_FRAMES):
+        """Extracts and processes frames with guaranteed consistent shape"""
+        cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_indices = self._get_frame_indices(total_frames, self.num_frames)
+
+        # To Get frame indices with fallback for short videos
+        frame_indices = self._get_frame_indices(total_frames, num_frames)
 
         frames = []
         for idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (self.frame_width, self.frame_height))
-                frame = frame.astype(np.float32) / 255.0
+                frame = self._process_frame(frame)
                 frames.append(frame)
             else:
+                # Use black frame if reading fails
                 frames.append(np.zeros((self.frame_height, self.frame_width, 3), dtype=np.float32))
+
         cap.release()
 
+        # Ensure exactly NUM_FRAMES frames
         frames = np.array(frames)
-        if len(frames) < self.num_frames:
-            padding = np.zeros((self.num_frames - len(frames), self.frame_height, self.frame_width, 3), dtype=np.float32)
+        if len(frames) < num_frames:
+            # Pad with black frames for missing frames
+            padding = np.zeros((num_frames - len(frames), self.frame_height, self.frame_width, 3), dtype=np.float32)
             frames = np.concatenate([frames, padding])
-        return frames[:self.num_frames]
+
+        return frames[:num_frames]
+
+    def _process_frame(self, frame):
+        """Process individual frame with consistent output shape"""
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+        frame = frame / 255.0  # Normalize
+        return frame
 
     def _get_frame_indices(self, total_frames, num_frames):
+        """Generate valid frame indices with fallback for short videos"""
         if total_frames <= num_frames:
             return list(range(total_frames))
+
         step = max(1, total_frames // num_frames)
         return [min(i * step, total_frames - 1) for i in range(num_frames)]
 
-# ==================== DATA LOADING ====================
+# DATA LOADING
 class CricketDataset:
-    def __init__(self, processor: VideoProcessor):
+    def __init__(self, processor):
         self.processor = processor
         self.class_names = []
 
-    def load_dataset(self, data_path: Path, expected_shape):
-        video_paths, labels = [], []
-        self.class_names = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
+    def load_dataset(self, data_path):
+        """Load and process dataset with strict shape validation"""
+        video_paths = []
+        labels = []
+        self.class_names = sorted(os.listdir(data_path))
 
+        # First pass: collect all video paths
         for class_idx, class_name in enumerate(self.class_names):
-            class_path = data_path / class_name
-            for video_file in class_path.glob("*.mp4"):
-                video_paths.append(video_file)
-                labels.append(class_idx)
+            class_path = os.path.join(data_path, class_name)
+            if not os.path.isdir(class_path):
+                continue
 
-        X, y = [], []
-        for vp, label in zip(video_paths, labels):
+            print(f"Processing class: {class_name}")
+            for video_file in os.listdir(class_path):
+                if video_file.endswith('.mp4'):
+                    video_paths.append(os.path.join(class_path, video_file))
+                    labels.append(class_idx)
+
+        # Second pass: process videos with strict shape validation
+        X = []
+        y = []
+        expected_shape = (NUM_FRAMES, FRAME_HEIGHT, FRAME_WIDTH, 3)
+
+        for video_path, label in zip(video_paths, labels):
             try:
-                frames = self.processor.extract_frames(vp)
+                frames = self.processor.extract_frames(video_path)
+
+                # Strict shape validation
                 if frames.shape == expected_shape:
                     X.append(frames)
                     y.append(label)
                 else:
-                    print(f"Skipping {vp} - invalid shape: {frames.shape}")
+                    print(f"Skipping {video_path} - invalid shape: {frames.shape}")
+
             except Exception as e:
-                print(f"Error processing {vp}: {e}")
+                print(f"Error processing {video_path}: {str(e)}")
 
         if not X:
-            raise ValueError(f"No valid videos found in {data_path}")
+            raise ValueError("No valid videos found after processing")
+
         return np.array(X, dtype=np.float32), np.array(y)
 
-# ==================== MODEL ARCHITECTURE ====================
-def build_model(input_shape, num_classes):
-    inputs = Input(shape=input_shape)
-    x = Conv3D(32, (3, 3, 3), activation='relu', padding='same')(inputs)
-    x = MaxPooling3D((1, 2, 2))(x)
-    x = BatchNormalization()(x)
+# MODEL ARCHITECTURE
+class CricketShotModel:
+    def __init__(self, input_shape, num_classes):
+        self.input_shape = input_shape
+        self.num_classes = num_classes
 
-    x = Conv3D(64, (3, 3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling3D((2, 2, 2))(x)
-    x = BatchNormalization()(x)
+    def build_model(self):
+        """Build 3D CNN model with simplified architecture"""
+        inputs = Input(shape=self.input_shape)
 
-    x = Conv3D(128, (3, 3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling3D((2, 2, 2))(x)
-    x = BatchNormalization()(x)
+        # Conv3D layers
+        x = Conv3D(32, (3, 3, 3), activation='relu', padding='same')(inputs)
+        x = MaxPooling3D((1, 2, 2))(x)
+        x = BatchNormalization()(x)
 
-    x = GlobalAveragePooling3D()(x)
-    x = Dense(256, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-    return Model(inputs, outputs)
+        x = Conv3D(64, (3, 3, 3), activation='relu', padding='same')(x)
+        x = MaxPooling3D((2, 2, 2))(x)
+        x = BatchNormalization()(x)
 
-# ==================== UTILS ====================
-def save_confusion_matrix(cm, class_names, out_path: Path):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', xticklabels=class_names, yticklabels=class_names)
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted'); plt.ylabel('True')
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+        x = Conv3D(128, (3, 3, 3), activation='relu', padding='same')(x)
+        x = MaxPooling3D((2, 2, 2))(x)
+        x = BatchNormalization()(x)
 
-# ==================== MAIN ====================
-def parse_args():
-    p = argparse.ArgumentParser(description="Train 3D CNN for cricket shot classification")
-    p.add_argument("--train_dir", type=str, required=True, help="Path to training data (class subfolders with .mp4)")
-    p.add_argument("--test_dir", type=str, default="", help="Path to test data (optional)")
-    p.add_argument("--outputs_dir", type=str, default="outputs", help="Where to save models/plots/logs")
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--num_classes", type=int, default=5)
-    p.add_argument("--frame_h", type=int, default=100)
-    p.add_argument("--frame_w", type=int, default=100)
-    p.add_argument("--num_frames", type=int, default=14)
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+        # Global pooling and dense layers
+        x = GlobalAveragePooling3D()(x)
+        x = Dense(256, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        outputs = Dense(self.num_classes, activation='softmax')(x)
 
+        model = Model(inputs, outputs)
+        return model
+
+# MAIN EXECUTION
 def main():
-    args = parse_args()
-    cfg = Config(frame_height=args.frame_h, frame_width=args.frame_w, num_frames=args.num_frames,
-                 num_classes=args.num_classes, batch_size=args.batch_size, epochs=args.epochs,
-                 learning_rate=args.lr, seed=args.seed)
-
-    set_seeds(cfg.seed)
-
-    outputs_dir = Path(args.outputs_dir)
-    models_dir = outputs_dir / "models"
-    plots_dir = outputs_dir / "plots"
-    logs_dir = outputs_dir / "logs"
-    models_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save config used
-    with open(outputs_dir / "run_config.json", "w") as f:
-        json.dump(asdict(cfg) | {"train_dir": args.train_dir, "test_dir": args.test_dir}, f, indent=2)
-
-    # Data
-    processor = VideoProcessor(cfg.frame_height, cfg.frame_width, cfg.num_frames)
+    # Initialize components
+    processor = VideoProcessor()
     dataset = CricketDataset(processor)
 
-    expected_shape = (cfg.num_frames, cfg.frame_height, cfg.frame_width, 3)
+    # Load and prepare data
+    print("\nLoading training data...")
+    try:
+        X, y = dataset.load_dataset(TRAIN_DATA_PATH)
+    except ValueError as e:
+        print(f"Error loading dataset: {e}")
+        return
 
-    X, y = dataset.load_dataset(Path(args.train_dir), expected_shape)
-    y = to_categorical(y, num_classes=cfg.num_classes)
+    # Encode labels
+    y = to_categorical(y, num_classes=NUM_CLASSES)
 
+    # Split data
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=cfg.seed, stratify=np.argmax(y, axis=1)
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # Model
-    model = build_model(
-        input_shape=(cfg.num_frames, cfg.frame_height, cfg.frame_width, 3),
-        num_classes=cfg.num_classes
+    # Build model
+    print("\nBuilding model...")
+    model_builder = CricketShotModel(
+        input_shape=(NUM_FRAMES, FRAME_HEIGHT, FRAME_WIDTH, 3),
+        num_classes=NUM_CLASSES
     )
-    model.compile(optimizer=Adam(learning_rate=cfg.learning_rate),
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
+    model = model_builder.build_model()
+
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
     model.summary()
 
-    # Training
-    best_model_path = models_dir / "cricket_shot_3d_attention_model4.h5"
-    callbacks = [
-        ModelCheckpoint(best_model_path.as_posix(), save_best_only=True, monitor='val_accuracy'),
-        EarlyStopping(patience=10, restore_best_weights=True, monitor='val_accuracy')
-    ]
+    # Train model
+    print("\nTraining model...")
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
-        epochs=cfg.epochs,
-        batch_size=cfg.batch_size,
-        callbacks=callbacks,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[
+            ModelCheckpoint(MODEL_PATH, save_best_only=True, monitor='val_accuracy'),
+            EarlyStopping(patience=10, restore_best_weights=True, monitor='val_accuracy')
+        ],
         verbose=1
     )
 
-    # Optional test
-    if args.test_dir and Path(args.test_dir).exists():
-        X_test, y_test_int = dataset.load_dataset(Path(args.test_dir), expected_shape)
-        y_test = to_categorical(y_test_int, num_classes=cfg.num_classes)
-        loss, acc = model.evaluate(X_test, y_test, verbose=0)
-        print(f"Test Accuracy: {acc*100:.2f}%")
+    # Evaluate on test data if available
+    if os.path.exists(TEST_DATA_PATH):
+        print("\nLoading test data...")
+        try:
+            X_test, y_test = dataset.load_dataset(TEST_DATA_PATH)
+            y_test = to_categorical(y_test, num_classes=NUM_CLASSES)
 
-        y_pred = model.predict(X_test)
-        y_true = y_test_int
-        y_pred_classes = np.argmax(y_pred, axis=1)
+            # Evaluation
+            loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+            print(f"\nTest Accuracy: {accuracy*100:.2f}%")
 
-        # report
-        report = classification_report(y_true, y_pred_classes, target_names=dataset.class_names, output_dict=True)
-        with open(outputs_dir / "classification_report.json", "w") as f:
-            json.dump(report, f, indent=2)
+            # Detailed metrics
+            y_pred = model.predict(X_test)
+            y_true = np.argmax(y_test, axis=1)
+            y_pred_classes = np.argmax(y_pred, axis=1)
 
-        # confusion matrix
-        cm = confusion_matrix(y_true, y_pred_classes)
-        save_confusion_matrix(cm, dataset.class_names, plots_dir / "confusion_matrix.png")
+            print("\nClassification Report:")
+            print(classification_report(y_true, y_pred_classes, target_names=dataset.class_names))
+
+            # Confusion matrix
+            cm = confusion_matrix(y_true, y_pred_classes)
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=dataset.class_names,
+                        yticklabels=dataset.class_names)
+            plt.title('Confusion Matrix')
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.show()
+
+        except Exception as e:
+            print(f"Error evaluating test xdata: {e}")
     else:
-        print("Test dir not provided or not found. Skipping evaluation.")
+        print("\nTest path not found. Skipping evaluation.")
 
 if __name__ == "__main__":
     main()
