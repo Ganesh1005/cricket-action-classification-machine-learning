@@ -1,9 +1,3 @@
-# Cricket Shot Classification (3D CNN)
-
-3D CNN to classify cricket batting shots from short video clips.
-
-Dataset videos :
-https://drive.google.com/drive/folders/1vhGSUhnmWmxuugCYGTo0aslSEqTPe-Cj?usp=sharing 
 
 ## Dataset Layout
 Place videos like:
